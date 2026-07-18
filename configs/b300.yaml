@@ -1,0 +1,11 @@
+# Target-shape description only. This large sweep is never run by default.
+# It can require tens of GiB for fp32 expert weights and is not a performance claim.
+tokens: [1, 8, 32, 128, 512]
+experts: [64, 128]
+top_k: [2]
+hidden_size: 4096
+intermediate_size: 14336
+workloads: [uniform, skewed, hot_expert]
+seed: 1234
+warmup: 10
+repetitions: 100

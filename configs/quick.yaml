@@ -1,0 +1,10 @@
+# Small, CPU-friendly correctness and development sweep.
+tokens: [1, 8, 32]
+experts: [4, 8]
+top_k: [1, 2]
+hidden_size: 64
+intermediate_size: 128
+workloads: [uniform, skewed, hot_expert]
+seed: 1234
+warmup: 3
+repetitions: 10
