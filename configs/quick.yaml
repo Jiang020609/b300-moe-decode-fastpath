@@ -1,10 +1,12 @@
-# Small, CPU-friendly correctness and development sweep.
-tokens: [1, 8, 32]
-experts: [4, 8]
-top_k: [1, 2]
+# Small-shape Goal 1B decode sweep. Use CLI overrides for the one-case smoke run;
+# the full Cartesian product is intentionally broader than a fast unit test.
+tokens: [1, 2, 4, 8, 16, 32, 64]
+experts: [8, 16]
+top_k: [1, 2, 4, 8]
 hidden_size: 64
 intermediate_size: 128
-workloads: [uniform, skewed, hot_expert]
+dtype: float32
+workloads: [uniform, hotspot, zipf]
 seed: 1234
 warmup: 3
 repetitions: 10

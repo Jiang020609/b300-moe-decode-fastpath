@@ -1,0 +1,45 @@
+name: CUDA extension
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/cuda-extension.yml"
+      - "csrc/**"
+      - "fastpath/**"
+      - "setup.py"
+      - "tests/**"
+  pull_request:
+    paths:
+      - ".github/workflows/cuda-extension.yml"
+      - "csrc/**"
+      - "fastpath/**"
+      - "setup.py"
+      - "tests/**"
+
+jobs:
+  compile-sm90:
+    runs-on: ubuntu-latest
+    container:
+      image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel@sha256:14611869895df612b7b07227d5925f30ec3cd6673bad58ce3d84ed107950e014
+    env:
+      MAX_JOBS: "2"
+      MOE_BUILD_CUDA: "1"
+      TORCH_CUDA_ARCH_LIST: "9.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies and build extension
+        run: |
+          python -m pip install --no-cache-dir pytest PyYAML
+          python -m pip install --no-build-isolation -e .
+      - name: Verify compiled module is importable
+        run: |
+          python - <<'PY'
+          import fastpath._C as extension
+
+          assert callable(extension.dispatch)
+          assert callable(extension.combine)
+          print("fastpath._C sm_90 build imported successfully")
+          PY
+      - name: Run CPU suite with CUDA runtime tests skipped
+        run: python -m pytest -q

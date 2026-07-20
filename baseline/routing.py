@@ -7,7 +7,7 @@ from typing import Literal
 
 import torch
 
-Workload = Literal["uniform", "skewed", "hot_expert"]
+Workload = Literal["uniform", "skewed", "hot_expert", "zipf", "hotspot"]
 
 
 @dataclass(frozen=True)
@@ -130,7 +130,7 @@ def generate_router_logits(
         raise ValueError("num_tokens and num_experts must be positive")
     if not 1 <= top_k <= num_experts:
         raise ValueError(f"top_k must be in [1, {num_experts}], got {top_k}")
-    if workload not in ("uniform", "skewed", "hot_expert"):
+    if workload not in ("uniform", "skewed", "hot_expert", "zipf", "hotspot"):
         raise ValueError(f"unknown workload {workload!r}")
     if not dtype.is_floating_point:
         raise TypeError("dtype must be floating point")
@@ -138,11 +138,16 @@ def generate_router_logits(
     generator = torch.Generator(device="cpu").manual_seed(seed)
     noise = torch.randn(num_tokens, num_experts, generator=generator, dtype=torch.float32) * 0.05
 
-    if workload == "uniform":
+    normalized_workload = {
+        "zipf": "skewed",
+        "hotspot": "hot_expert",
+    }.get(workload, workload)
+
+    if normalized_workload == "uniform":
         token_ids = torch.arange(num_tokens).unsqueeze(1)
         ranks = torch.arange(top_k).unsqueeze(0)
         targets = (token_ids * top_k + ranks) % num_experts
-    elif workload == "skewed":
+    elif normalized_workload == "skewed":
         probabilities = torch.arange(1, num_experts + 1, dtype=torch.float32).reciprocal()
         probabilities /= probabilities.sum()
         targets = _sample_distinct_experts(probabilities, num_tokens, top_k, generator)

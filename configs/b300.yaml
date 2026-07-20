@@ -1,11 +1,14 @@
-# Target-shape description only. This large sweep is never run by default.
-# It can require tens of GiB for fp32 expert weights and is not a performance claim.
-tokens: [1, 8, 32, 128, 512]
+# Target-shape description only. Run this explicitly on the B300 target host.
+# The largest case requires about 42 GiB for BF16 expert weights alone; this is
+# not a CPU smoke configuration and is not a performance claim.
+requires_cuda: true
+tokens: [1, 2, 4, 8, 16, 32, 64]
 experts: [64, 128]
 top_k: [2]
 hidden_size: 4096
 intermediate_size: 14336
-workloads: [uniform, skewed, hot_expert]
+dtype: bfloat16
+workloads: [uniform, hotspot, zipf]
 seed: 1234
 warmup: 10
 repetitions: 100

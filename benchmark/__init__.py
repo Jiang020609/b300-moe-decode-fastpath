@@ -1,1 +1,1 @@
-"""Benchmark utilities for the PyTorch Local-MoE baseline."""
+"""Benchmark utilities for torch and CUDA-extension Local-MoE paths."""

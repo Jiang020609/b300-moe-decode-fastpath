@@ -50,6 +50,15 @@ def test_uniform_workload_balances_assignments() -> None:
     assert int(counts.max() - counts.min()) <= 1
 
 
+def test_goal_1b_workload_aliases_match_goal_1a_semantics() -> None:
+    zipf = generate_router_logits(32, 8, 2, "zipf", seed=77)
+    skewed = generate_router_logits(32, 8, 2, "skewed", seed=77)
+    hotspot = generate_router_logits(32, 8, 2, "hotspot", seed=78)
+    hot_expert = generate_router_logits(32, 8, 2, "hot_expert", seed=78)
+    torch.testing.assert_close(zipf, skewed, atol=0, rtol=0)
+    torch.testing.assert_close(hotspot, hot_expert, atol=0, rtol=0)
+
+
 def test_skewed_and_hot_workloads_are_imbalanced() -> None:
     skewed, _ = topk_routing(generate_router_logits(2048, 16, 1, "skewed", seed=4), 1)
     skewed_counts = torch.bincount(skewed.reshape(-1), minlength=16)
