@@ -42,6 +42,12 @@ from baseline.torch_moe import (
 )
 from benchmark.timing import TimingSummary, benchmark_callable
 from fastpath.b300_moe import B300MoEWorkspace, b300_moe_forward
+from fastpath.gemm_dispatch import (
+    GemmPolicy,
+    normalize_gemm_policy,
+    per_expert_gemm_out,
+    select_gemm_strategy,
+)
 from fastpath.reference import build_routing_metadata
 
 Backend = Literal["torch", "cutlass_bf16", "cutlass_nvfp4"]
@@ -85,6 +91,9 @@ CSV_FIELDS = (
     "intermediate_size",
     "quant_mode",
     "used_fallback",
+    "gemm_policy",
+    "gate_up_gemm_strategy",
+    "down_gemm_strategy",
     "stage",
     "stage_status",
     "measurement",
@@ -144,6 +153,7 @@ class CaseResult:
     cold_start_us: float
     metadata: Mapping[str, object]
     stages: Mapping[str, StageSummary]
+    gemm_strategies: Mapping[str, str]
 
 
 def _positive_int_list(config: Mapping[str, Any], key: str) -> list[int]:
@@ -380,7 +390,8 @@ def _compiled_stage_callables(
     inputs: BenchmarkInputs,
     workspace: B300MoEWorkspace,
     total: Callable[[], object],
-) -> Mapping[str, Callable[[], object]]:
+    gemm_policy: GemmPolicy = "grouped",
+) -> tuple[Mapping[str, Callable[[], object]], dict[str, str]]:
     extension = importlib.import_module("fastpath._C")
     buffers = workspace.buffers
     assignments = inputs.hidden_states.shape[0] * inputs.top_k
@@ -398,6 +409,35 @@ def _compiled_stage_callables(
     )
     offsets_i32 = buffers["expert_offsets_i32"][: inputs.num_experts]
     offsets_i32.copy_(offsets[1:])
+
+    # Stage timing must exercise the same GEMM strategy the requested policy
+    # selects end-to-end; the host offsets sync happens here, outside the
+    # timed region, exactly like the end-to-end fast path resolves it once
+    # per forward.
+    assignments_total = int(assignments)
+    gate_up_strategy = "grouped"
+    down_strategy = "grouped"
+    host_offsets: list[int] | None = None
+    if gemm_policy != "grouped":
+        host_offsets = offsets.tolist()
+        active_experts = sum(
+            1
+            for expert in range(inputs.num_experts)
+            if host_offsets[expert + 1] > host_offsets[expert]
+        )
+        gate_up_strategy = select_gemm_strategy(
+            "gate_up",
+            total_rows=assignments_total,
+            active_experts=active_experts,
+            policy=gemm_policy,
+        )
+        down_strategy = select_gemm_strategy(
+            "down",
+            total_rows=assignments_total,
+            active_experts=active_experts,
+            policy=gemm_policy,
+        )
+
     permuted = buffers["permuted_hidden"][:assignments]
     gate_up_output = buffers["gate_up_output"][:assignments]
     swiglu_output = buffers["swiglu_output"][:assignments]
@@ -423,17 +463,40 @@ def _compiled_stage_callables(
     return {
         "routing_us": lambda: topk_routing(inputs.router_logits, inputs.top_k),
         "permutation_us": permutation,
-        "gate_up_gemm_us": lambda: extension.grouped_gemm_bf16_out(
-            permuted, packed_gate_up, offsets_i32, gate_up_output
+        "gate_up_gemm_us": (
+            (
+                lambda: extension.grouped_gemm_bf16_out(
+                    permuted, packed_gate_up, offsets_i32, gate_up_output
+                )
+            )
+            if gate_up_strategy == "grouped"
+            else (
+                lambda: per_expert_gemm_out(
+                    permuted, packed_gate_up, host_offsets, gate_up_output
+                )
+            )
         ),
         "swiglu_us": lambda: extension.swiglu_out(gate_up_output, swiglu_output),
-        "down_gemm_us": lambda: extension.grouped_gemm_bf16_out(
-            swiglu_output, packed_down, offsets_i32, expert_output
+        "down_gemm_us": (
+            (
+                lambda: extension.grouped_gemm_bf16_out(
+                    swiglu_output, packed_down, offsets_i32, expert_output
+                )
+            )
+            if down_strategy == "grouped"
+            else (
+                lambda: per_expert_gemm_out(
+                    swiglu_output, packed_down, host_offsets, expert_output
+                )
+            )
         ),
         "combine_us": lambda: extension.combine_out(
             expert_output, assignment_to_permuted, inputs.expert_weights, combined
         ),
         "total_us": total,
+    }, {
+        "gate_up_gemm_strategy": gate_up_strategy,
+        "down_gemm_strategy": down_strategy,
     }
 
 
@@ -444,6 +507,7 @@ def _benchmark_case(
     device: torch.device,
     warmup: int,
     repetitions: int,
+    gemm_policy: GemmPolicy = "grouped",
 ) -> CaseResult:
     if backend != "torch" and device.type != "cuda":
         raise BackendUnavailableError(
@@ -478,6 +542,7 @@ def _benchmark_case(
             quant_mode=quant_mode,
             backend=backend,
             workspace=workspace,
+            gemm_policy=gemm_policy,
         )
 
     try:
@@ -495,6 +560,7 @@ def _benchmark_case(
             quant_mode=quant_mode,
             backend=backend,
             workspace=workspace,
+            gemm_policy=gemm_policy,
             return_metadata=True,
         )
     except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
@@ -514,9 +580,17 @@ def _benchmark_case(
 
     if backend == "torch":
         callables = _torch_stage_callables(inputs, total)
+        # The dense torch backend never routes through the hybrid GEMM
+        # dispatch, so strategies are reported truthfully as not applicable.
+        gemm_strategies = {
+            "gate_up_gemm_strategy": "not_applicable",
+            "down_gemm_strategy": "not_applicable",
+        }
     else:
         try:
-            callables = _compiled_stage_callables(inputs, workspace, total)
+            callables, gemm_strategies = _compiled_stage_callables(
+                inputs, workspace, total, gemm_policy
+            )
         except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
             raise BackendUnavailableError(
                 f"backend={backend!r} staged benchmark setup failed: {error}"
@@ -536,7 +610,12 @@ def _benchmark_case(
             warmup=warmup,
             repetitions=repetitions,
         )
-    return CaseResult(cold_start_us=cold, metadata=metadata, stages=summaries)
+    return CaseResult(
+        cold_start_us=cold,
+        metadata=metadata,
+        stages=summaries,
+        gemm_strategies=gemm_strategies,
+    )
 
 
 def _parse_version_header(path: Path) -> str:
@@ -664,11 +743,13 @@ def run(
     dtype: str | None = None,
     warmup: int | None = None,
     repetitions: int | None = None,
+    gemm_policy: str = "grouped",
     skip_unavailable: bool = False,
 ) -> int:
     """Run selected cases and write one percentile-summary CSV."""
 
     selected_device = _resolve_device(device)
+    selected_gemm_policy = normalize_gemm_policy(gemm_policy)
     if bool(config.get("requires_cuda", False)) and selected_device.type != "cuda":
         raise BackendUnavailableError(
             "this target-scale configuration requires --device cuda; refusing "
@@ -754,6 +835,7 @@ def run(
                                 device=selected_device,
                                 warmup=selected_warmup,
                                 repetitions=selected_repetitions,
+                                gemm_policy=selected_gemm_policy,
                             )
                         except BackendUnavailableError as error:
                             if not skip_unavailable:
@@ -805,6 +887,13 @@ def run(
                             "intermediate_size": selected_intermediate,
                             "quant_mode": metadata["quant_mode"],
                             "used_fallback": str(bool(metadata["used_fallback"])).lower(),
+                            "gemm_policy": selected_gemm_policy,
+                            "gate_up_gemm_strategy": result.gemm_strategies[
+                                "gate_up_gemm_strategy"
+                            ],
+                            "down_gemm_strategy": result.gemm_strategies[
+                                "down_gemm_strategy"
+                            ],
                             "measurement": "steady_state",
                             "cold_start_us": f"{result.cold_start_us:.9f}",
                             "cold_start_scope": "first_forward_after_input_setup",
@@ -923,6 +1012,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int)
     parser.add_argument("--repeats", type=int)
     parser.add_argument(
+        "--gemm-policy",
+        choices=("grouped", "auto", "per_expert"),
+        default="grouped",
+        help="Goal 1C GEMM strategy for compiled backends; "
+        "'grouped' is the validated Goal 1B behavior",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=REPOSITORY_ROOT / "results/goal_1b_benchmark.csv",
@@ -947,6 +1043,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dtype=arguments.dtype,
             warmup=arguments.warmup,
             repetitions=arguments.repeats,
+            gemm_policy=arguments.gemm_policy,
             skip_unavailable=arguments.skip_unavailable,
         )
     except BackendUnavailableError as error:

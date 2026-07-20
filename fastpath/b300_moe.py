@@ -14,6 +14,13 @@ from typing import Literal, Mapping, TypedDict, overload
 
 import torch
 
+from .gemm_dispatch import (
+    GemmPolicy,
+    GemmStrategy,
+    normalize_gemm_policy,
+    per_expert_gemm_out,
+    select_gemm_strategy,
+)
 from .reference import (
     SUPPORTED_DTYPES,
     RoutedMoEShape,
@@ -43,6 +50,7 @@ class B300MoEMetadata(_B300MoEMetadataRequired, total=False):
     reverse_mapping: torch.Tensor
     workspace: dict[str, object]
     build: dict[str, object]
+    gemm_dispatch: dict[str, object]
 
 
 def _normalize_device(device: torch.device | str) -> torch.device:
@@ -618,7 +626,8 @@ def _call_compiled_bf16(
     down_weight: torch.Tensor,
     shape: RoutedMoEShape,
     workspace: B300MoEWorkspace,
-) -> tuple[torch.Tensor, Mapping[str, torch.Tensor]]:
+    gemm_policy: GemmPolicy = "grouped",
+) -> tuple[torch.Tensor, Mapping[str, torch.Tensor], dict[str, object]]:
     """Orchestrate the extension's caller-owned staged BF16 operations."""
 
     assignments = shape.num_assignments
@@ -654,17 +663,71 @@ def _call_compiled_bf16(
     # visible immediately and no stale packed-weight cache is possible.
     packed_gate_up = gate_up_weight.transpose(1, 2)
     packed_down = down_weight.transpose(1, 2)
+
+    # Launch the permutation gather before any host-side dispatch decision so
+    # the device stays busy while the offsets sync below blocks the CPU.
     try:
         extension.permute_out(
             hidden_states, routed["permutation"], shape.top_k, permuted_hidden
         )
-        extension.grouped_gemm_bf16_out(
-            permuted_hidden, packed_gate_up, offsets_i32, gate_up_output
+    except Exception as error:
+        raise RuntimeError("a staged Goal 1B BF16 extension operation failed") from error
+
+    # Goal 1C hybrid dispatch: decide per GEMM stage between the grouped
+    # kernel and a per-active-expert matmul loop. The loop needs host-side
+    # offsets for Python slicing, which costs one device sync (overlapped
+    # with the permute kernel launched above); the default "grouped" policy
+    # skips that copy and is byte-for-byte the validated Goal 1B path.
+    gate_up_strategy: GemmStrategy = "grouped"
+    down_strategy: GemmStrategy = "grouped"
+    host_offsets: list[int] | None = None
+    active_experts: int | None = None
+    if gemm_policy != "grouped":
+        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "per-expert GEMM dispatch requires host-side expert offsets "
+                "and cannot run during CUDA graph capture; use "
+                "gemm_policy='grouped'"
+            )
+        host_offsets = routed["expert_offsets"].tolist()
+        active_experts = sum(
+            1
+            for expert in range(shape.num_experts)
+            if host_offsets[expert + 1] > host_offsets[expert]
         )
+        gate_up_strategy = select_gemm_strategy(
+            "gate_up",
+            total_rows=assignments,
+            active_experts=active_experts,
+            policy=gemm_policy,
+        )
+        down_strategy = select_gemm_strategy(
+            "down",
+            total_rows=assignments,
+            active_experts=active_experts,
+            policy=gemm_policy,
+        )
+
+    try:
+        if gate_up_strategy == "grouped":
+            extension.grouped_gemm_bf16_out(
+                permuted_hidden, packed_gate_up, offsets_i32, gate_up_output
+            )
+        else:
+            assert host_offsets is not None
+            per_expert_gemm_out(
+                permuted_hidden, packed_gate_up, host_offsets, gate_up_output
+            )
         extension.swiglu_out(gate_up_output, swiglu_output)
-        extension.grouped_gemm_bf16_out(
-            swiglu_output, packed_down, offsets_i32, expert_output
-        )
+        if down_strategy == "grouped":
+            extension.grouped_gemm_bf16_out(
+                swiglu_output, packed_down, offsets_i32, expert_output
+            )
+        else:
+            assert host_offsets is not None
+            per_expert_gemm_out(
+                swiglu_output, packed_down, host_offsets, expert_output
+            )
         extension.combine_out(
             expert_output, routed["reverse_mapping"], expert_weights, output
         )
@@ -682,7 +745,14 @@ def _call_compiled_bf16(
         raise RuntimeError("compiled BF16 path returned the wrong dtype or device")
     if not output.is_contiguous():
         raise RuntimeError("compiled BF16 path returned non-contiguous output")
-    return output, routed
+    dispatch_info: dict[str, object] = {
+        "policy": gemm_policy,
+        "gate_up_strategy": gate_up_strategy,
+        "down_strategy": down_strategy,
+        "total_rows": assignments,
+        "active_experts": active_experts,
+    }
+    return output, routed, dispatch_info
 
 
 def _metadata(
@@ -746,6 +816,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
+    gemm_policy: GemmPolicy = "grouped",
     return_metadata: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -763,6 +834,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
+    gemm_policy: GemmPolicy = "grouped",
     return_metadata: Literal[True],
 ) -> tuple[torch.Tensor, B300MoEMetadata]: ...
 
@@ -779,6 +851,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
+    gemm_policy: GemmPolicy = "grouped",
     return_metadata: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, B300MoEMetadata]:
     """Run explicitly routed two-GEMM SwiGLU MoE execution.
@@ -786,11 +859,18 @@ def b300_moe_forward(
     The ``torch`` backend is dense and does not emulate NVFP4.  Requesting a
     CUTLASS backend is an exact request: missing extension features, wrong
     hardware, or incompatible dtypes raise instead of falling back.
+
+    ``gemm_policy`` selects the Goal 1C GEMM execution strategy on the
+    compiled BF16 path: ``"grouped"`` (default, the validated Goal 1B
+    behavior), ``"per_expert"`` (force the per-active-expert matmul loop), or
+    ``"auto"`` (measured-data-driven hybrid dispatch).  The ``torch`` backend
+    computes densely and ignores the policy beyond validation.
     """
 
     if not isinstance(return_metadata, bool):
         raise TypeError("return_metadata must be a bool")
     normalized_backend = _normalize_backend(backend)
+    normalized_gemm_policy = normalize_gemm_policy(gemm_policy)
     shape = validate_routed_moe_inputs(
         hidden_states,
         expert_indices,
@@ -854,6 +934,7 @@ def b300_moe_forward(
             )
 
         routing = None
+        gemm_dispatch_info: dict[str, object] | None = None
         if normalized_backend == "torch":
             buffers = None if active_workspace is None else active_workspace.buffers
             output, routing = _routed_moe_reference_with_routing(
@@ -869,7 +950,7 @@ def b300_moe_forward(
         else:
             if extension is None or active_workspace is None:
                 raise RuntimeError("compiled backend initialization is incomplete")
-            output, routing = _call_compiled_bf16(
+            output, routing, gemm_dispatch_info = _call_compiled_bf16(
                 extension,
                 hidden_states,
                 expert_indices,
@@ -878,6 +959,7 @@ def b300_moe_forward(
                 down_weight,
                 shape,
                 active_workspace,
+                normalized_gemm_policy,
             )
         # Clone routing metadata while the workspace lock is still held. On
         # CUDA the completion event must be recorded *after* these async copies,
@@ -894,6 +976,8 @@ def b300_moe_forward(
                 workspace_reused=workspace_reused,
                 build_info=compiled_build_info,
             )
+            if gemm_dispatch_info is not None:
+                result_metadata["gemm_dispatch"] = gemm_dispatch_info
         if active_workspace is not None:
             active_workspace._record_use()
 
