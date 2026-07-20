@@ -173,10 +173,29 @@ stages use workspace buffers; the rows are end-to-end stage costs, not identical
 low-level GEMM-only experiments. CUDA “cold start” means first measured device
 execution after input construction, not full process startup or JIT compilation.
 
+## Goal 1C hybrid GEMM dispatch
+
+The compiled BF16 path selects a GEMM execution strategy per stage via
+`gemm_policy`: `"auto"` (default), `"grouped"`, or `"per_expert"`. The `auto`
+policy uses B300-measured rules: the per-active-expert matmul loop everywhere
+in the measured decode range, except the down projection with >=32 rows over
+>=32 active experts, and any case beyond the measured range, which return to
+the grouped kernel. During CUDA graph capture `auto` degrades to the
+capture-safe grouped kernels; forcing `per_expert` there raises instead.
+Selections are reported in `metadata["gemm_dispatch"]` and in the benchmark
+CSV columns `gemm_policy`, `gate_up_gemm_strategy`, and `down_gemm_strategy`.
+
+B300 A/B validation (H=4096, I=14336, E=64, top-k=2; tokens 1/4/8/32;
+uniform and hotspot): `auto` beat `grouped` end-to-end P50 in 8/8 cases,
+geometric-mean speedup 1.0916x. See
+[`results/b300_goal1c_20260720/ab_summary.md`](results/b300_goal1c_20260720/ab_summary.md).
+
 ## Current limitations
 
-- B300 compilation, BF16 correctness, and B300 latency are unverified on this
-  CPU-only host; therefore the Goal 1B hardware acceptance criteria are open.
+- B300 compilation, BF16 correctness, and latency were validated on a B300
+  host for Goal 1B (`results/b300_goal1b_20260720/`) and for the Goal 1C
+  hybrid dispatch A/B run (`results/b300_goal1c_20260720/`); NVFP4 acceptance
+  criteria remain open.
 - The BF16 adapter depends on an internal PyTorch C++ symbol and on that PyTorch
   build containing a suitable SM103 grouped-GEMM implementation.
 - Real NVFP4 quantization, scale handling, weight prepacking, descriptor caching,

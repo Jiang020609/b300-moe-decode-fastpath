@@ -390,7 +390,7 @@ def _compiled_stage_callables(
     inputs: BenchmarkInputs,
     workspace: B300MoEWorkspace,
     total: Callable[[], object],
-    gemm_policy: GemmPolicy = "grouped",
+    gemm_policy: GemmPolicy = "auto",
 ) -> tuple[Mapping[str, Callable[[], object]], dict[str, str]]:
     extension = importlib.import_module("fastpath._C")
     buffers = workspace.buffers
@@ -507,7 +507,7 @@ def _benchmark_case(
     device: torch.device,
     warmup: int,
     repetitions: int,
-    gemm_policy: GemmPolicy = "grouped",
+    gemm_policy: GemmPolicy = "auto",
 ) -> CaseResult:
     if backend != "torch" and device.type != "cuda":
         raise BackendUnavailableError(
@@ -743,7 +743,7 @@ def run(
     dtype: str | None = None,
     warmup: int | None = None,
     repetitions: int | None = None,
-    gemm_policy: str = "grouped",
+    gemm_policy: str = "auto",
     skip_unavailable: bool = False,
 ) -> int:
     """Run selected cases and write one percentile-summary CSV."""
@@ -1014,9 +1014,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gemm-policy",
         choices=("grouped", "auto", "per_expert"),
-        default="grouped",
+        default="auto",
         help="Goal 1C GEMM strategy for compiled backends; "
-        "'grouped' is the validated Goal 1B behavior",
+        "'auto' is the B300-validated hybrid default, 'grouped' is the "
+        "Goal 1B baseline",
     )
     parser.add_argument(
         "--output",

@@ -626,7 +626,7 @@ def _call_compiled_bf16(
     down_weight: torch.Tensor,
     shape: RoutedMoEShape,
     workspace: B300MoEWorkspace,
-    gemm_policy: GemmPolicy = "grouped",
+    gemm_policy: GemmPolicy = "auto",
 ) -> tuple[torch.Tensor, Mapping[str, torch.Tensor], dict[str, object]]:
     """Orchestrate the extension's caller-owned staged BF16 operations."""
 
@@ -676,19 +676,24 @@ def _call_compiled_bf16(
     # Goal 1C hybrid dispatch: decide per GEMM stage between the grouped
     # kernel and a per-active-expert matmul loop. The loop needs host-side
     # offsets for Python slicing, which costs one device sync (overlapped
-    # with the permute kernel launched above); the default "grouped" policy
-    # skips that copy and is byte-for-byte the validated Goal 1B path.
+    # with the permute kernel launched above); the "grouped" policy skips
+    # that copy and is byte-for-byte the validated Goal 1B path.
     gate_up_strategy: GemmStrategy = "grouped"
     down_strategy: GemmStrategy = "grouped"
     host_offsets: list[int] | None = None
     active_experts: int | None = None
-    if gemm_policy != "grouped":
-        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "per-expert GEMM dispatch requires host-side expert offsets "
-                "and cannot run during CUDA graph capture; use "
-                "gemm_policy='grouped'"
-            )
+    capturing = hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
+    if gemm_policy == "per_expert" and capturing:
+        raise RuntimeError(
+            "per-expert GEMM dispatch requires host-side expert offsets "
+            "and cannot run during CUDA graph capture; use "
+            "gemm_policy='grouped'"
+        )
+    # "auto" degrades to the capture-safe grouped kernels instead of raising:
+    # picking the best strategy that is legal in the current context is
+    # exactly what "auto" promises, and the choice stays auditable through
+    # the gemm_dispatch metadata below.
+    if gemm_policy != "grouped" and not capturing:
         host_offsets = routed["expert_offsets"].tolist()
         active_experts = sum(
             1
@@ -816,7 +821,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
-    gemm_policy: GemmPolicy = "grouped",
+    gemm_policy: GemmPolicy = "auto",
     return_metadata: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -834,7 +839,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
-    gemm_policy: GemmPolicy = "grouped",
+    gemm_policy: GemmPolicy = "auto",
     return_metadata: Literal[True],
 ) -> tuple[torch.Tensor, B300MoEMetadata]: ...
 
@@ -851,7 +856,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
-    gemm_policy: GemmPolicy = "grouped",
+    gemm_policy: GemmPolicy = "auto",
     return_metadata: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, B300MoEMetadata]:
     """Run explicitly routed two-GEMM SwiGLU MoE execution.
@@ -861,10 +866,13 @@ def b300_moe_forward(
     hardware, or incompatible dtypes raise instead of falling back.
 
     ``gemm_policy`` selects the Goal 1C GEMM execution strategy on the
-    compiled BF16 path: ``"grouped"`` (default, the validated Goal 1B
-    behavior), ``"per_expert"`` (force the per-active-expert matmul loop), or
-    ``"auto"`` (measured-data-driven hybrid dispatch).  The ``torch`` backend
-    computes densely and ignores the policy beyond validation.
+    compiled BF16 path: ``"auto"`` (default, measured-data-driven hybrid
+    dispatch; validated on B300 with 8/8 A/B wins), ``"grouped"`` (the
+    validated Goal 1B baseline), or ``"per_expert"`` (force the
+    per-active-expert matmul loop).  During CUDA graph capture ``"auto"``
+    degrades to the capture-safe grouped kernels while ``"per_expert"``
+    raises.  The ``torch`` backend computes densely and ignores the policy
+    beyond validation.
     """
 
     if not isinstance(return_metadata, bool):

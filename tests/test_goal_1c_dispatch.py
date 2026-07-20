@@ -193,6 +193,16 @@ def test_forward_rejects_unknown_policy() -> None:
         b300_moe_forward(*tensors, num_experts=4, top_k=2, gemm_policy=1)  # type: ignore[arg-type]
 
 
+def test_forward_default_policy_is_auto() -> None:
+    # The B300 A/B run (results/b300_goal1c_20260720) showed auto winning
+    # end-to-end P50 in 8/8 cases, so auto is the promoted default. Lock the
+    # signature so a silent revert to "grouped" fails loudly here.
+    import inspect
+
+    signature = inspect.signature(b300_moe_forward)
+    assert signature.parameters["gemm_policy"].default == "auto"
+
+
 # ---------------------------------------------------------------------------
 # B300 layer: the compiled BF16 path must produce equivalent outputs under
 # every policy and report the chosen strategies truthfully.
