@@ -17,6 +17,14 @@ This module keeps the decision logic and the per-expert executor separate
 from the orchestration in :mod:`fastpath.b300_moe` so both are unit-testable
 on CPU.  The policy is measured-data-driven and intentionally conservative:
 anything outside the measured decode range falls back to the grouped kernel.
+
+Goal 1C step 2 adds the ``fused`` strategy: a repository-compiled kernel
+(``csrc/fused_gemm_kernels.cu``) that reads the routing prefix sum on device
+and computes every expert's tiny-M GEMM in one launch.  The A/B run in
+``results/b300_goal1c_20260720`` showed the per-expert loop's host offsets
+sync eating ~2/3 of its kernel-level win; ``fused`` removes that sync and
+the per-expert launch overhead entirely.  It is opt-in (``policy="fused"``)
+until B300 A/B data justifies promoting it into ``auto``.
 """
 
 from __future__ import annotations
@@ -26,8 +34,8 @@ from typing import Literal, Sequence
 import torch
 
 GemmOperation = Literal["gate_up", "down"]
-GemmStrategy = Literal["grouped", "per_expert"]
-GemmPolicy = Literal["auto", "grouped", "per_expert"]
+GemmStrategy = Literal["grouped", "per_expert", "fused"]
+GemmPolicy = Literal["auto", "grouped", "per_expert", "fused"]
 
 # Measured decode range: the GEMM-only benchmark covered total_rows (M) up to
 # 64.  Beyond twice that we have no evidence, and the grouped kernel's fixed
@@ -44,9 +52,9 @@ _DOWN_GROUPED_MIN_ACTIVE_EXPERTS = 32
 def normalize_gemm_policy(policy: object) -> GemmPolicy:
     if not isinstance(policy, str):
         raise TypeError("gemm_policy must be a string")
-    if policy not in ("auto", "grouped", "per_expert"):
+    if policy not in ("auto", "grouped", "per_expert", "fused"):
         raise ValueError(
-            "gemm_policy must be 'auto', 'grouped', or 'per_expert'"
+            "gemm_policy must be 'auto', 'grouped', 'per_expert', or 'fused'"
         )
     return policy  # type: ignore[return-value]
 
@@ -81,6 +89,11 @@ def select_gemm_strategy(
         return "grouped"
     if normalized == "per_expert":
         return "per_expert"
+    if normalized == "fused":
+        # Forced opt-in: the fused kernel is new in Goal 1C step 2 and stays
+        # out of "auto" until a B300 A/B run ranks it against the two
+        # validated strategies.
+        return "fused"
 
     # Unmeasured territory (large prefill-like batches): stay on the
     # validated grouped path rather than extrapolating the loop's win.

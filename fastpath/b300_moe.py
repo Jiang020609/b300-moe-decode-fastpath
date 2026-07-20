@@ -689,11 +689,23 @@ def _call_compiled_bf16(
             "and cannot run during CUDA graph capture; use "
             "gemm_policy='grouped'"
         )
+    if gemm_policy == "fused":
+        # The fused kernel consumes the device-resident [E + 1] prefix sum
+        # directly, so it needs no host offsets and is capture-safe. It is
+        # an exact request: an extension built before Goal 1C step 2 lacks
+        # the operation and must fail loudly, not fall back.
+        if not hasattr(extension, "fused_grouped_gemm_bf16_out"):
+            raise RuntimeError(
+                "gemm_policy='fused' requires fastpath._C.fused_grouped_gemm_bf16_out; "
+                "rebuild the Goal 1B extension from this source tree"
+            )
+        gate_up_strategy = "fused"
+        down_strategy = "fused"
     # "auto" degrades to the capture-safe grouped kernels instead of raising:
     # picking the best strategy that is legal in the current context is
     # exactly what "auto" promises, and the choice stays auditable through
     # the gemm_dispatch metadata below.
-    if gemm_policy != "grouped" and not capturing:
+    elif gemm_policy != "grouped" and not capturing:
         host_offsets = routed["expert_offsets"].tolist()
         active_experts = sum(
             1
@@ -718,6 +730,13 @@ def _call_compiled_bf16(
             extension.grouped_gemm_bf16_out(
                 permuted_hidden, packed_gate_up, offsets_i32, gate_up_output
             )
+        elif gate_up_strategy == "fused":
+            extension.fused_grouped_gemm_bf16_out(
+                permuted_hidden,
+                packed_gate_up,
+                routed["expert_offsets"],
+                gate_up_output,
+            )
         else:
             assert host_offsets is not None
             per_expert_gemm_out(
@@ -727,6 +746,10 @@ def _call_compiled_bf16(
         if down_strategy == "grouped":
             extension.grouped_gemm_bf16_out(
                 swiglu_output, packed_down, offsets_i32, expert_output
+            )
+        elif down_strategy == "fused":
+            extension.fused_grouped_gemm_bf16_out(
+                swiglu_output, packed_down, routed["expert_offsets"], expert_output
             )
         else:
             assert host_offsets is not None
@@ -868,11 +891,13 @@ def b300_moe_forward(
     ``gemm_policy`` selects the Goal 1C GEMM execution strategy on the
     compiled BF16 path: ``"auto"`` (default, measured-data-driven hybrid
     dispatch; validated on B300 with 8/8 A/B wins), ``"grouped"`` (the
-    validated Goal 1B baseline), or ``"per_expert"`` (force the
-    per-active-expert matmul loop).  During CUDA graph capture ``"auto"``
-    degrades to the capture-safe grouped kernels while ``"per_expert"``
-    raises.  The ``torch`` backend computes densely and ignores the policy
-    beyond validation.
+    validated Goal 1B baseline), ``"per_expert"`` (force the
+    per-active-expert matmul loop), or ``"fused"`` (force the Goal 1C step 2
+    single-launch device-offset kernel; requires an extension built from
+    this source tree and is opt-in until B300 A/B validation).  During CUDA
+    graph capture ``"auto"`` degrades to the capture-safe grouped kernels
+    and ``"per_expert"`` raises; ``"fused"`` is capture-safe.  The ``torch``
+    backend computes densely and ignores the policy beyond validation.
     """
 
     if not isinstance(return_metadata, bool):

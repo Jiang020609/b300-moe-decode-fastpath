@@ -52,6 +52,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &grouped_gemm_bf16_out_cuda,
       "ATen BF16 grouped GEMM into caller-owned storage (CUDA, internal)");
   module.def(
+      "fused_grouped_gemm_bf16_out",
+      &fused_grouped_gemm_bf16_out_cuda,
+      "Goal 1C device-offset fused BF16 grouped GEMM (CUDA, internal)");
+  module.def(
       "nvfp4_grouped_gemm_available",
       &nvfp4_grouped_gemm_available_cuda,
       "Whether a real SM103 NVFP4 grouped GEMM adapter was compiled");

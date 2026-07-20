@@ -33,6 +33,7 @@ GOAL1B_SOURCES = (
     "csrc/permutation_kernels.cu",
     "csrc/quantization_kernels.cu",
     "csrc/grouped_gemm_sm103.cu",
+    "csrc/fused_gemm_kernels.cu",
     "csrc/combine_kernels.cu",
 )
 GOAL1B_MIN_CUTLASS = (4, 3, 1)

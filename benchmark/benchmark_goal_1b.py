@@ -413,12 +413,21 @@ def _compiled_stage_callables(
     # Stage timing must exercise the same GEMM strategy the requested policy
     # selects end-to-end; the host offsets sync happens here, outside the
     # timed region, exactly like the end-to-end fast path resolves it once
-    # per forward.
+    # per forward.  The fused kernel consumes device offsets directly, so it
+    # needs no host copy at all.
     assignments_total = int(assignments)
     gate_up_strategy = "grouped"
     down_strategy = "grouped"
     host_offsets: list[int] | None = None
-    if gemm_policy != "grouped":
+    if gemm_policy == "fused":
+        if not hasattr(extension, "fused_grouped_gemm_bf16_out"):
+            raise BackendUnavailableError(
+                "gemm_policy='fused' requires fastpath._C.fused_grouped_gemm_bf16_out; "
+                "rebuild the Goal 1B extension from this source tree"
+            )
+        gate_up_strategy = "fused"
+        down_strategy = "fused"
+    elif gemm_policy != "grouped":
         host_offsets = offsets.tolist()
         active_experts = sum(
             1
@@ -471,6 +480,12 @@ def _compiled_stage_callables(
             )
             if gate_up_strategy == "grouped"
             else (
+                lambda: extension.fused_grouped_gemm_bf16_out(
+                    permuted, packed_gate_up, offsets, gate_up_output
+                )
+            )
+            if gate_up_strategy == "fused"
+            else (
                 lambda: per_expert_gemm_out(
                     permuted, packed_gate_up, host_offsets, gate_up_output
                 )
@@ -484,6 +499,12 @@ def _compiled_stage_callables(
                 )
             )
             if down_strategy == "grouped"
+            else (
+                lambda: extension.fused_grouped_gemm_bf16_out(
+                    swiglu_output, packed_down, offsets, expert_output
+                )
+            )
+            if down_strategy == "fused"
             else (
                 lambda: per_expert_gemm_out(
                     swiglu_output, packed_down, host_offsets, expert_output
@@ -1013,11 +1034,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repeats", type=int)
     parser.add_argument(
         "--gemm-policy",
-        choices=("grouped", "auto", "per_expert"),
+        choices=("grouped", "auto", "per_expert", "fused"),
         default="auto",
         help="Goal 1C GEMM strategy for compiled backends; "
         "'auto' is the B300-validated hybrid default, 'grouped' is the "
-        "Goal 1B baseline",
+        "Goal 1B baseline, 'fused' is the opt-in device-offset kernel",
     )
     parser.add_argument(
         "--output",

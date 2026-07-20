@@ -45,5 +45,15 @@ void grouped_gemm_bf16_out_cuda(
     torch::Tensor expert_offsets_i32,
     torch::Tensor output);
 
+// Goal 1C fused device-side grouped GEMM. Reads the int64 [E + 1] routing
+// prefix sum directly on device (no host offsets sync) and computes every
+// expert's tiny-M GEMM in a single launch. Optimized for decode shapes where
+// the weight stream is the bandwidth bottleneck.
+void fused_grouped_gemm_bf16_out_cuda(
+    torch::Tensor activations,
+    torch::Tensor packed_weights,
+    torch::Tensor expert_offsets,
+    torch::Tensor output);
+
 bool nvfp4_grouped_gemm_available_cuda();
 std::string nvfp4_grouped_gemm_unavailable_reason_cuda();
