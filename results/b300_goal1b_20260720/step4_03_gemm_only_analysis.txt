@@ -1,0 +1,48 @@
+speedup = matmul_p50 / grouped_mm_p50; >1 means grouped_mm is faster
+
+operation   E   M active   grouped_us   matmul_us   speedup      winner
+down        8   1      1       96.320      36.160    0.3754      matmul
+down        8   2      2      100.704      59.008    0.5860      matmul
+down        8   4      4      120.144     102.624    0.8542      matmul
+down        8   8      8      224.704     191.840    0.8537      matmul
+down        8  16      8      208.800     197.344    0.9451      matmul
+down        8  32      8      213.920     194.048    0.9071      matmul
+down        8  64      8      254.896     190.112    0.7458      matmul
+down       64   1      1       96.256      35.520    0.3690      matmul
+down       64   2      2       99.712      59.088    0.5926      matmul
+down       64   4      4      121.088     104.384    0.8621      matmul
+down       64   8      8      211.872     194.368    0.9174      matmul
+down       64  16     16      395.888     379.632    0.9589      matmul
+down       64  32     32      717.488     743.392    1.0361  grouped_mm
+down       64  64     64     1416.944    1488.912    1.0508  grouped_mm
+gate_up     8   1      1       89.568      55.584    0.6206      matmul
+gate_up     8   2      2      152.848      96.608    0.6321      matmul
+gate_up     8   4      4      259.136     178.960    0.6906      matmul
+gate_up     8   8      8      463.568     342.272    0.7383      matmul
+gate_up     8  16      8      436.912     347.968    0.7964      matmul
+gate_up     8  32      8      418.656     350.816    0.8380      matmul
+gate_up     8  64      8      438.320     358.208    0.8172      matmul
+gate_up    64   1      1       86.720      55.152    0.6360      matmul
+gate_up    64   2      2      149.664      96.608    0.6455      matmul
+gate_up    64   4      4      258.112     180.128    0.6979      matmul
+gate_up    64   8      8      463.376     345.424    0.7455      matmul
+gate_up    64  16     16      882.416     678.320    0.7687      matmul
+gate_up    64  32     32     1621.216    1339.728    0.8264      matmul
+gate_up    64  64     64     3060.528    2670.784    0.8727      matmul
+
+=== geometric-mean speedup by group ===
+operation=down    E= 8 geomean=0.7223 min=0.3754 max=0.9451
+operation=down    E=64 geomean=0.7831 min=0.3690 max=1.0508
+operation=gate_up E= 8 geomean=0.7287 min=0.6206 max=0.8380
+operation=gate_up E=64 geomean=0.7373 min=0.6360 max=0.8727
+
+=== winner counts ===
+GROUPED_MM_WINS= 2
+MATMUL_WINS= 26
+TIES= 0
+
+=== grouped-MM crossover cases ===
+operation=down E=64 M=32 speedup=1.0361
+operation=down E=64 M=64 speedup=1.0508
+
+STEP4_03_ANALYSIS=PASS

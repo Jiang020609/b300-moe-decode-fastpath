@@ -8,6 +8,14 @@ from .b300_moe import (
     b300_moe_forward,
 )
 
+from .gemm_dispatch import (
+    GemmOperation,
+    GemmPolicy,
+    GemmStrategy,
+    per_expert_gemm_out,
+    select_gemm_strategy,
+)
+
 from .ops import (
     DispatchResult,
     combine_tokens,
@@ -27,6 +35,9 @@ __all__ = [
     "B300MoEMetadata",
     "B300MoEWorkspace",
     "DispatchResult",
+    "GemmOperation",
+    "GemmPolicy",
+    "GemmStrategy",
     "QuantMode",
     "RoutedMoEShape",
     "b300_moe_forward",
@@ -35,6 +46,8 @@ __all__ = [
     "cuda_extension_available",
     "cuda_extension_error",
     "dispatch_tokens",
+    "per_expert_gemm_out",
     "routed_moe_reference",
+    "select_gemm_strategy",
     "validate_routed_moe_inputs",
 ]

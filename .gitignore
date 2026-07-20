@@ -6,3 +6,4 @@ build/
 *.egg-info/
 fastpath/_C*.so
 fastpath/_C*.pyd
+.venv/

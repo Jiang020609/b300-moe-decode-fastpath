@@ -1,0 +1,12 @@
+torch: 2.12.1+cu130
+device: NVIDIA B300 SXM6 AC
+capability: (10, 3)
+E,K,N: 8 64 96
+M= 1 counts=[1, 0, 0, 0, 0, 0, 0, 0] offsets=[1, 1, 1, 1, 1, 1, 1, 1] repeated=7 shape=(1, 96) exact=True close=True max_abs=0.000000
+M= 2 counts=[1, 1, 0, 0, 0, 0, 0, 0] offsets=[1, 2, 2, 2, 2, 2, 2, 2] repeated=6 shape=(2, 96) exact=True close=True max_abs=0.000000
+M= 3 counts=[1, 1, 1, 0, 0, 0, 0, 0] offsets=[1, 2, 3, 3, 3, 3, 3, 3] repeated=5 shape=(3, 96) exact=True close=True max_abs=0.000000
+M= 7 counts=[1, 1, 1, 1, 1, 1, 1, 0] offsets=[1, 2, 3, 4, 5, 6, 7, 7] repeated=1 shape=(7, 96) exact=True close=True max_abs=0.000000
+M= 8 counts=[1, 1, 1, 1, 1, 1, 1, 1] offsets=[1, 2, 3, 4, 5, 6, 7, 8] repeated=0 shape=(8, 96) exact=True close=True max_abs=0.000000
+M= 9 counts=[2, 1, 1, 1, 1, 1, 1, 1] offsets=[2, 3, 4, 5, 6, 7, 8, 9] repeated=0 shape=(9, 96) exact=True close=True max_abs=0.000000
+M=16 counts=[2, 2, 2, 2, 2, 2, 2, 2] offsets=[2, 4, 6, 8, 10, 12, 14, 16] repeated=0 shape=(16, 96) exact=True close=True max_abs=0.000000
+STEP4_01_EMPTY_EXPERT_CONTRACT=PASS

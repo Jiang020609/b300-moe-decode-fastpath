@@ -1,0 +1,36 @@
+=== strict B300 target CSV gate ===
+BENCHMARK_EXIT_STATUS=0
+CSV_PATH=/artifacts/hw_validation/step3_03_b300_target_benchmark.csv
+CSV_EXISTS=True
+CSV_ROWS=336
+UNIQUE_CASES=42
+REQUESTED_BACKENDS={'cutlass_bf16': 336}
+ACTUAL_BACKENDS={'cutlass_bf16': 336}
+USED_FALLBACK_VALUES={'false': 336}
+DTYPE_VALUES={'bfloat16': 336}
+DEVICE_VALUES={'cuda:0': 336}
+ARCHITECTURE_VALUES={'sm_103a': 336}
+EXPERT_VALUES={64: 168, 128: 168}
+TOKEN_VALUES={1: 48, 2: 48, 4: 48, 8: 48, 16: 48, 32: 48, 64: 48}
+TOPK_VALUES={2: 336}
+WORKLOAD_VALUES={'uniform': 112, 'hotspot': 112, 'zipf': 112}
+BACKEND_MISMATCH_ROWS=0
+BAD_STAGE_CASES=0
+BAD_NUMERIC_ROWS=0
+CHECK benchmark_exit_zero: True
+CHECK rows_exactly_336: True
+CHECK cases_exactly_42: True
+CHECK requested_backend_cutlass_only: True
+CHECK actual_backend_cutlass_only: True
+CHECK requested_equals_actual: True
+CHECK no_fallback: True
+CHECK dtype_is_bfloat16: True
+CHECK device_is_cuda0: True
+CHECK architecture_is_sm103a: True
+CHECK experts_are_64_and_128: True
+CHECK tokens_are_1_to_64: True
+CHECK topk_is_2: True
+CHECK workloads_are_complete: True
+CHECK all_cases_have_8_expected_stages: True
+CHECK timing_values_valid: True
+B300_TARGET_RESULT=PASS

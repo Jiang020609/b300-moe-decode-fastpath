@@ -14,6 +14,13 @@ from typing import Literal, Mapping, TypedDict, overload
 
 import torch
 
+from .gemm_dispatch import (
+    GemmPolicy,
+    GemmStrategy,
+    normalize_gemm_policy,
+    per_expert_gemm_out,
+    select_gemm_strategy,
+)
 from .reference import (
     SUPPORTED_DTYPES,
     RoutedMoEShape,
@@ -43,6 +50,7 @@ class B300MoEMetadata(_B300MoEMetadataRequired, total=False):
     reverse_mapping: torch.Tensor
     workspace: dict[str, object]
     build: dict[str, object]
+    gemm_dispatch: dict[str, object]
 
 
 def _normalize_device(device: torch.device | str) -> torch.device:
@@ -393,6 +401,118 @@ def _load_goal_1b_extension() -> ModuleType:
         ) from error
 
 
+
+_GROUPED_MM_RUNTIME_PROBED_DEVICES: set[int] = set()
+
+
+def _verify_grouped_mm_runtime(device: torch.device) -> None:
+    """Verify the PyTorch BF16 GroupMM provider on one CC 10.3 device."""
+
+    device_index = (
+        torch.cuda.current_device()
+        if device.index is None
+        else int(device.index)
+    )
+
+    if device_index in _GROUPED_MM_RUNTIME_PROBED_DEVICES:
+        return
+
+    grouped_mm = getattr(torch, "_grouped_mm", None)
+    if not callable(grouped_mm):
+        raise RuntimeError(
+            "the active PyTorch build does not expose torch._grouped_mm; "
+            "the audited BF16 GroupMM provider is unavailable"
+        )
+
+    probe_device = torch.device("cuda", device_index)
+
+    try:
+        with torch.no_grad():
+            tokens_per_expert = 16
+            expert_count = 2
+            k = 64
+            n = 64
+            total_tokens = tokens_per_expert * expert_count
+
+            activation_values = torch.arange(
+                total_tokens * k,
+                device=probe_device,
+                dtype=torch.float32,
+            ).reshape(total_tokens, k)
+            activations = (
+                ((activation_values % 23) - 11) / 8
+            ).to(torch.bfloat16)
+
+            weight_values = torch.arange(
+                expert_count * k * n,
+                device=probe_device,
+                dtype=torch.float32,
+            ).reshape(expert_count, k, n)
+            weights = (
+                ((weight_values % 19) - 9) / 8
+            ).to(torch.bfloat16)
+
+            offsets = torch.tensor(
+                [tokens_per_expert, total_tokens],
+                device=probe_device,
+                dtype=torch.int32,
+            )
+
+            output = grouped_mm(
+                activations,
+                weights,
+                offs=offsets,
+            )
+
+            reference = torch.cat(
+                [
+                    activations[:tokens_per_expert] @ weights[0],
+                    activations[tokens_per_expert:] @ weights[1],
+                ],
+                dim=0,
+            )
+
+            torch.cuda.synchronize(device_index)
+
+            if tuple(output.shape) != tuple(reference.shape):
+                raise RuntimeError(
+                    "provider returned shape "
+                    f"{tuple(output.shape)}, expected "
+                    f"{tuple(reference.shape)}"
+                )
+
+            if output.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "provider returned dtype "
+                    f"{output.dtype}, expected torch.bfloat16"
+                )
+
+            if not bool(
+                torch.allclose(
+                    output.float(),
+                    reference.float(),
+                    rtol=5e-2,
+                    atol=1e-1,
+                )
+            ):
+                max_abs_diff = (
+                    output.float() - reference.float()
+                ).abs().max().item()
+                raise RuntimeError(
+                    "provider produced incorrect output; "
+                    f"max_abs_diff={max_abs_diff}"
+                )
+
+    except Exception as error:
+        raise RuntimeError(
+            "PyTorch grouped-MM provider runtime verification failed "
+            f"on cuda:{device_index}: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+
+    _GROUPED_MM_RUNTIME_PROBED_DEVICES.add(device_index)
+
+
 def _resolve_compiled_backend(
     backend: B300Backend,
     hidden_states: torch.Tensor,
@@ -411,14 +531,7 @@ def _resolve_compiled_backend(
             f"backend={backend!r} requires B300 compute capability (10, 3), "
             f"got {capability}"
         )
-    torch_arches = tuple(torch.cuda.get_arch_list())
-    if not any(
-        arch.startswith(("sm_103", "compute_103")) for arch in torch_arches
-    ):
-        raise RuntimeError(
-            "the active PyTorch binary does not advertise an SM103 grouped-MM "
-            f"provider architecture: {torch_arches}"
-        )
+    _verify_grouped_mm_runtime(hidden_states.device)
     if backend == "cutlass_bf16" and hidden_states.dtype != torch.bfloat16:
         raise TypeError("cutlass_bf16 requires bfloat16 inputs and weights")
     if backend == "cutlass_bf16" and (
@@ -513,7 +626,8 @@ def _call_compiled_bf16(
     down_weight: torch.Tensor,
     shape: RoutedMoEShape,
     workspace: B300MoEWorkspace,
-) -> tuple[torch.Tensor, Mapping[str, torch.Tensor]]:
+    gemm_policy: GemmPolicy = "auto",
+) -> tuple[torch.Tensor, Mapping[str, torch.Tensor], dict[str, object]]:
     """Orchestrate the extension's caller-owned staged BF16 operations."""
 
     assignments = shape.num_assignments
@@ -549,17 +663,76 @@ def _call_compiled_bf16(
     # visible immediately and no stale packed-weight cache is possible.
     packed_gate_up = gate_up_weight.transpose(1, 2)
     packed_down = down_weight.transpose(1, 2)
+
+    # Launch the permutation gather before any host-side dispatch decision so
+    # the device stays busy while the offsets sync below blocks the CPU.
     try:
         extension.permute_out(
             hidden_states, routed["permutation"], shape.top_k, permuted_hidden
         )
-        extension.grouped_gemm_bf16_out(
-            permuted_hidden, packed_gate_up, offsets_i32, gate_up_output
+    except Exception as error:
+        raise RuntimeError("a staged Goal 1B BF16 extension operation failed") from error
+
+    # Goal 1C hybrid dispatch: decide per GEMM stage between the grouped
+    # kernel and a per-active-expert matmul loop. The loop needs host-side
+    # offsets for Python slicing, which costs one device sync (overlapped
+    # with the permute kernel launched above); the "grouped" policy skips
+    # that copy and is byte-for-byte the validated Goal 1B path.
+    gate_up_strategy: GemmStrategy = "grouped"
+    down_strategy: GemmStrategy = "grouped"
+    host_offsets: list[int] | None = None
+    active_experts: int | None = None
+    capturing = hidden_states.is_cuda and torch.cuda.is_current_stream_capturing()
+    if gemm_policy == "per_expert" and capturing:
+        raise RuntimeError(
+            "per-expert GEMM dispatch requires host-side expert offsets "
+            "and cannot run during CUDA graph capture; use "
+            "gemm_policy='grouped'"
         )
+    # "auto" degrades to the capture-safe grouped kernels instead of raising:
+    # picking the best strategy that is legal in the current context is
+    # exactly what "auto" promises, and the choice stays auditable through
+    # the gemm_dispatch metadata below.
+    if gemm_policy != "grouped" and not capturing:
+        host_offsets = routed["expert_offsets"].tolist()
+        active_experts = sum(
+            1
+            for expert in range(shape.num_experts)
+            if host_offsets[expert + 1] > host_offsets[expert]
+        )
+        gate_up_strategy = select_gemm_strategy(
+            "gate_up",
+            total_rows=assignments,
+            active_experts=active_experts,
+            policy=gemm_policy,
+        )
+        down_strategy = select_gemm_strategy(
+            "down",
+            total_rows=assignments,
+            active_experts=active_experts,
+            policy=gemm_policy,
+        )
+
+    try:
+        if gate_up_strategy == "grouped":
+            extension.grouped_gemm_bf16_out(
+                permuted_hidden, packed_gate_up, offsets_i32, gate_up_output
+            )
+        else:
+            assert host_offsets is not None
+            per_expert_gemm_out(
+                permuted_hidden, packed_gate_up, host_offsets, gate_up_output
+            )
         extension.swiglu_out(gate_up_output, swiglu_output)
-        extension.grouped_gemm_bf16_out(
-            swiglu_output, packed_down, offsets_i32, expert_output
-        )
+        if down_strategy == "grouped":
+            extension.grouped_gemm_bf16_out(
+                swiglu_output, packed_down, offsets_i32, expert_output
+            )
+        else:
+            assert host_offsets is not None
+            per_expert_gemm_out(
+                swiglu_output, packed_down, host_offsets, expert_output
+            )
         extension.combine_out(
             expert_output, routed["reverse_mapping"], expert_weights, output
         )
@@ -577,7 +750,14 @@ def _call_compiled_bf16(
         raise RuntimeError("compiled BF16 path returned the wrong dtype or device")
     if not output.is_contiguous():
         raise RuntimeError("compiled BF16 path returned non-contiguous output")
-    return output, routed
+    dispatch_info: dict[str, object] = {
+        "policy": gemm_policy,
+        "gate_up_strategy": gate_up_strategy,
+        "down_strategy": down_strategy,
+        "total_rows": assignments,
+        "active_experts": active_experts,
+    }
+    return output, routed, dispatch_info
 
 
 def _metadata(
@@ -641,6 +821,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
+    gemm_policy: GemmPolicy = "auto",
     return_metadata: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -658,6 +839,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
+    gemm_policy: GemmPolicy = "auto",
     return_metadata: Literal[True],
 ) -> tuple[torch.Tensor, B300MoEMetadata]: ...
 
@@ -674,6 +856,7 @@ def b300_moe_forward(
     quant_mode: QuantMode | None = None,
     backend: B300Backend = "torch",
     workspace: B300MoEWorkspace | None = None,
+    gemm_policy: GemmPolicy = "auto",
     return_metadata: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, B300MoEMetadata]:
     """Run explicitly routed two-GEMM SwiGLU MoE execution.
@@ -681,11 +864,21 @@ def b300_moe_forward(
     The ``torch`` backend is dense and does not emulate NVFP4.  Requesting a
     CUTLASS backend is an exact request: missing extension features, wrong
     hardware, or incompatible dtypes raise instead of falling back.
+
+    ``gemm_policy`` selects the Goal 1C GEMM execution strategy on the
+    compiled BF16 path: ``"auto"`` (default, measured-data-driven hybrid
+    dispatch; validated on B300 with 8/8 A/B wins), ``"grouped"`` (the
+    validated Goal 1B baseline), or ``"per_expert"`` (force the
+    per-active-expert matmul loop).  During CUDA graph capture ``"auto"``
+    degrades to the capture-safe grouped kernels while ``"per_expert"``
+    raises.  The ``torch`` backend computes densely and ignores the policy
+    beyond validation.
     """
 
     if not isinstance(return_metadata, bool):
         raise TypeError("return_metadata must be a bool")
     normalized_backend = _normalize_backend(backend)
+    normalized_gemm_policy = normalize_gemm_policy(gemm_policy)
     shape = validate_routed_moe_inputs(
         hidden_states,
         expert_indices,
@@ -749,6 +942,7 @@ def b300_moe_forward(
             )
 
         routing = None
+        gemm_dispatch_info: dict[str, object] | None = None
         if normalized_backend == "torch":
             buffers = None if active_workspace is None else active_workspace.buffers
             output, routing = _routed_moe_reference_with_routing(
@@ -764,7 +958,7 @@ def b300_moe_forward(
         else:
             if extension is None or active_workspace is None:
                 raise RuntimeError("compiled backend initialization is incomplete")
-            output, routing = _call_compiled_bf16(
+            output, routing, gemm_dispatch_info = _call_compiled_bf16(
                 extension,
                 hidden_states,
                 expert_indices,
@@ -773,6 +967,7 @@ def b300_moe_forward(
                 down_weight,
                 shape,
                 active_workspace,
+                normalized_gemm_policy,
             )
         # Clone routing metadata while the workspace lock is still held. On
         # CUDA the completion event must be recorded *after* these async copies,
@@ -789,6 +984,8 @@ def b300_moe_forward(
                 workspace_reused=workspace_reused,
                 build_info=compiled_build_info,
             )
+            if gemm_dispatch_info is not None:
+                result_metadata["gemm_dispatch"] = gemm_dispatch_info
         if active_workspace is not None:
             active_workspace._record_use()
 
