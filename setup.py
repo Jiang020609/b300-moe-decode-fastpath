@@ -176,10 +176,126 @@ if build_cuda:
                 arch.startswith(("sm_103", "compute_103"))
                 for arch in torch_arches
             ):
-                errors.append(
-                    "the PyTorch binary does not advertise SM103 in "
-                    f"torch.cuda.get_arch_list(): {torch_arches}"
+                print(
+                    "Goal 1B warning: torch.cuda.get_arch_list() does not "
+                    f"advertise SM103: {torch_arches}; verifying the PyTorch "
+                    "grouped-MM provider with an on-device runtime probe"
                 )
+
+            target_indices = [
+                index
+                for index in range(torch.cuda.device_count())
+                if torch.cuda.get_device_capability(index) == (10, 3)
+            ]
+
+            if target_indices:
+                grouped_mm = getattr(torch, "_grouped_mm", None)
+
+                if not callable(grouped_mm):
+                    errors.append(
+                        "the active PyTorch build does not expose "
+                        "torch._grouped_mm for the on-device provider probe"
+                    )
+                else:
+                    device_index = target_indices[0]
+                    device = f"cuda:{device_index}"
+
+                    try:
+                        with torch.no_grad():
+                            tokens_per_expert = 16
+                            expert_count = 2
+                            k = 64
+                            n = 64
+                            total_tokens = (
+                                tokens_per_expert * expert_count
+                            )
+
+                            torch.manual_seed(0)
+
+                            activations = torch.randn(
+                                total_tokens,
+                                k,
+                                device=device,
+                                dtype=torch.bfloat16,
+                            )
+                            weights = torch.randn(
+                                expert_count,
+                                k,
+                                n,
+                                device=device,
+                                dtype=torch.bfloat16,
+                            )
+                            offsets = torch.tensor(
+                                [
+                                    tokens_per_expert,
+                                    total_tokens,
+                                ],
+                                device=device,
+                                dtype=torch.int32,
+                            )
+
+                            output = grouped_mm(
+                                activations,
+                                weights,
+                                offs=offsets,
+                            )
+                            reference = torch.cat(
+                                [
+                                    activations[
+                                        :tokens_per_expert
+                                    ] @ weights[0],
+                                    activations[
+                                        tokens_per_expert:
+                                    ] @ weights[1],
+                                ],
+                                dim=0,
+                            )
+
+                            torch.cuda.synchronize(device_index)
+
+                            if tuple(output.shape) != tuple(
+                                reference.shape
+                            ):
+                                errors.append(
+                                    "PyTorch grouped-MM provider probe "
+                                    f"returned shape {tuple(output.shape)}, "
+                                    f"expected {tuple(reference.shape)}"
+                                )
+                            elif output.dtype != torch.bfloat16:
+                                errors.append(
+                                    "PyTorch grouped-MM provider probe "
+                                    f"returned dtype {output.dtype}, "
+                                    "expected torch.bfloat16"
+                                )
+                            elif not bool(
+                                torch.allclose(
+                                    output.float(),
+                                    reference.float(),
+                                    rtol=5e-2,
+                                    atol=1e-1,
+                                )
+                            ):
+                                max_abs_diff = (
+                                    output.float()
+                                    - reference.float()
+                                ).abs().max().item()
+                                errors.append(
+                                    "PyTorch grouped-MM provider probe "
+                                    "produced incorrect output; "
+                                    f"max_abs_diff={max_abs_diff}"
+                                )
+                            else:
+                                print(
+                                    "Goal 1B PyTorch grouped-MM "
+                                    "runtime probe: PASS"
+                                )
+
+                    except Exception as error:
+                        errors.append(
+                            "PyTorch grouped-MM provider runtime probe "
+                            f"failed on {device}: "
+                            f"{type(error).__name__}: {error}"
+                        )
         sources = GOAL1B_SOURCES
         missing_sources = [source for source in sources if not (ROOT / source).is_file()]
         if missing_sources:

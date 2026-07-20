@@ -393,6 +393,118 @@ def _load_goal_1b_extension() -> ModuleType:
         ) from error
 
 
+
+_GROUPED_MM_RUNTIME_PROBED_DEVICES: set[int] = set()
+
+
+def _verify_grouped_mm_runtime(device: torch.device) -> None:
+    """Verify the PyTorch BF16 GroupMM provider on one CC 10.3 device."""
+
+    device_index = (
+        torch.cuda.current_device()
+        if device.index is None
+        else int(device.index)
+    )
+
+    if device_index in _GROUPED_MM_RUNTIME_PROBED_DEVICES:
+        return
+
+    grouped_mm = getattr(torch, "_grouped_mm", None)
+    if not callable(grouped_mm):
+        raise RuntimeError(
+            "the active PyTorch build does not expose torch._grouped_mm; "
+            "the audited BF16 GroupMM provider is unavailable"
+        )
+
+    probe_device = torch.device("cuda", device_index)
+
+    try:
+        with torch.no_grad():
+            tokens_per_expert = 16
+            expert_count = 2
+            k = 64
+            n = 64
+            total_tokens = tokens_per_expert * expert_count
+
+            activation_values = torch.arange(
+                total_tokens * k,
+                device=probe_device,
+                dtype=torch.float32,
+            ).reshape(total_tokens, k)
+            activations = (
+                ((activation_values % 23) - 11) / 8
+            ).to(torch.bfloat16)
+
+            weight_values = torch.arange(
+                expert_count * k * n,
+                device=probe_device,
+                dtype=torch.float32,
+            ).reshape(expert_count, k, n)
+            weights = (
+                ((weight_values % 19) - 9) / 8
+            ).to(torch.bfloat16)
+
+            offsets = torch.tensor(
+                [tokens_per_expert, total_tokens],
+                device=probe_device,
+                dtype=torch.int32,
+            )
+
+            output = grouped_mm(
+                activations,
+                weights,
+                offs=offsets,
+            )
+
+            reference = torch.cat(
+                [
+                    activations[:tokens_per_expert] @ weights[0],
+                    activations[tokens_per_expert:] @ weights[1],
+                ],
+                dim=0,
+            )
+
+            torch.cuda.synchronize(device_index)
+
+            if tuple(output.shape) != tuple(reference.shape):
+                raise RuntimeError(
+                    "provider returned shape "
+                    f"{tuple(output.shape)}, expected "
+                    f"{tuple(reference.shape)}"
+                )
+
+            if output.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "provider returned dtype "
+                    f"{output.dtype}, expected torch.bfloat16"
+                )
+
+            if not bool(
+                torch.allclose(
+                    output.float(),
+                    reference.float(),
+                    rtol=5e-2,
+                    atol=1e-1,
+                )
+            ):
+                max_abs_diff = (
+                    output.float() - reference.float()
+                ).abs().max().item()
+                raise RuntimeError(
+                    "provider produced incorrect output; "
+                    f"max_abs_diff={max_abs_diff}"
+                )
+
+    except Exception as error:
+        raise RuntimeError(
+            "PyTorch grouped-MM provider runtime verification failed "
+            f"on cuda:{device_index}: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+
+    _GROUPED_MM_RUNTIME_PROBED_DEVICES.add(device_index)
+
+
 def _resolve_compiled_backend(
     backend: B300Backend,
     hidden_states: torch.Tensor,
@@ -411,14 +523,7 @@ def _resolve_compiled_backend(
             f"backend={backend!r} requires B300 compute capability (10, 3), "
             f"got {capability}"
         )
-    torch_arches = tuple(torch.cuda.get_arch_list())
-    if not any(
-        arch.startswith(("sm_103", "compute_103")) for arch in torch_arches
-    ):
-        raise RuntimeError(
-            "the active PyTorch binary does not advertise an SM103 grouped-MM "
-            f"provider architecture: {torch_arches}"
-        )
+    _verify_grouped_mm_runtime(hidden_states.device)
     if backend == "cutlass_bf16" and hidden_states.dtype != torch.bfloat16:
         raise TypeError("cutlass_bf16 requires bfloat16 inputs and weights")
     if backend == "cutlass_bf16" and (

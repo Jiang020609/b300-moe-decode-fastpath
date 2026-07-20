@@ -1,0 +1,22 @@
+RAW_ROWS= 56
+SUMMARY_ROWS= 28
+UNIQUE_CASES= 56
+BACKEND_COUNTS= Counter({'grouped_mm': 28, 'matmul': 28})
+OPERATION_COUNTS= Counter({'gate_up': 28, 'down': 28})
+M_VALUES= [1, 2, 4, 8, 16, 32, 64]
+EXPERT_VALUES= [8, 64]
+BAD_NUMERIC= []
+BAD_SPEEDUPS= []
+CHECK raw_rows_56: True
+CHECK summary_rows_28: True
+CHECK unique_cases_56: True
+CHECK m_complete: True
+CHECK experts_complete: True
+CHECK operations_complete: True
+CHECK backends_complete: True
+CHECK dtype_bfloat16: True
+CHECK device_cuda0: True
+CHECK architecture_sm103a: True
+CHECK numeric_valid: True
+CHECK speedup_valid: True
+STEP4_02C_VALIDATION=PASS

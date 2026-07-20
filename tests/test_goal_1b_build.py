@@ -115,7 +115,7 @@ def test_package_version_parser_accepts_local_build_suffix() -> None:
     assert build._parse_package_version("development") is None
 
 
-def test_preflight_rejects_pytorch_binary_without_sm103_provider(
+def test_preflight_treats_torch_arch_list_as_informational(
     tmp_path: Path,
 ) -> None:
     report = build.probe_environment(
@@ -125,7 +125,16 @@ def test_preflight_rejects_pytorch_binary_without_sm103_provider(
 
     assert report.target_gpu is not None
     assert report.torch_arch_list == ("sm_90", "sm_100")
-    assert any("does not advertise an SM103" in error for error in report.errors)
+    assert any(
+        "does not advertise SM103" in warning
+        for warning in report.warnings
+    )
+    assert not any(
+        "does not advertise" in error
+        and "SM103" in error
+        for error in report.errors
+    )
+    assert not report.grouped_mm_runtime_probe
 
 
 def test_cutlass_probe_reads_header_version_and_capability_evidence(

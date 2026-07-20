@@ -91,6 +91,7 @@ class PreflightReport:
     torch_arch_list: tuple[str, ...] = ()
     groupmm_header: Path | None = None
     grouped_mm_api_available: bool = False
+    grouped_mm_runtime_probe: bool = False
     cuda_home: Path | None = None
     cuda_home_source: str | None = None
     nvcc_path: Path | None = None
@@ -345,6 +346,117 @@ def _probe_host(
         )
 
 
+
+def _probe_grouped_mm_runtime(
+    report: PreflightReport,
+    torch_module: Any,
+) -> None:
+    """Execute a small BF16 GroupMM on the audited CC 10.3 GPU."""
+
+    if report.target_gpu is None:
+        return
+
+    grouped_mm = getattr(torch_module, "_grouped_mm", None)
+    if not callable(grouped_mm):
+        report.errors.append(
+            "cannot run the grouped-MM provider runtime probe because "
+            "torch._grouped_mm is unavailable"
+        )
+        return
+
+    device_index = report.target_gpu.index
+    device = f"cuda:{device_index}"
+
+    try:
+        with torch_module.no_grad():
+            tokens_per_expert = 16
+            expert_count = 2
+            k = 64
+            n = 64
+            total_tokens = tokens_per_expert * expert_count
+
+            torch_module.manual_seed(0)
+
+            activations = torch_module.randn(
+                total_tokens,
+                k,
+                device=device,
+                dtype=torch_module.bfloat16,
+            )
+            weights = torch_module.randn(
+                expert_count,
+                k,
+                n,
+                device=device,
+                dtype=torch_module.bfloat16,
+            )
+            offsets = torch_module.tensor(
+                [tokens_per_expert, total_tokens],
+                device=device,
+                dtype=torch_module.int32,
+            )
+
+            output = grouped_mm(
+                activations,
+                weights,
+                offs=offsets,
+            )
+
+            reference = torch_module.cat(
+                [
+                    activations[:tokens_per_expert] @ weights[0],
+                    activations[tokens_per_expert:] @ weights[1],
+                ],
+                dim=0,
+            )
+
+            torch_module.cuda.synchronize(device_index)
+
+            if tuple(output.shape) != tuple(reference.shape):
+                report.errors.append(
+                    "PyTorch grouped-MM provider runtime probe returned "
+                    f"shape {tuple(output.shape)}, expected "
+                    f"{tuple(reference.shape)}"
+                )
+                return
+
+            if output.dtype != torch_module.bfloat16:
+                report.errors.append(
+                    "PyTorch grouped-MM provider runtime probe returned "
+                    f"dtype {output.dtype}, expected torch.bfloat16"
+                )
+                return
+
+            output_fp32 = output.float()
+            reference_fp32 = reference.float()
+
+            if not bool(
+                torch_module.allclose(
+                    output_fp32,
+                    reference_fp32,
+                    rtol=5e-2,
+                    atol=1e-1,
+                )
+            ):
+                max_abs_diff = (
+                    output_fp32 - reference_fp32
+                ).abs().max().item()
+                report.errors.append(
+                    "PyTorch grouped-MM provider runtime probe produced "
+                    f"incorrect output; max_abs_diff={max_abs_diff}"
+                )
+                return
+
+    except Exception as error:
+        report.errors.append(
+            "PyTorch grouped-MM provider runtime probe failed on "
+            f"{device}: {type(error).__name__}: {error}"
+        )
+        return
+
+    report.grouped_mm_runtime_probe = True
+
+
 def _probe_torch(
     report: PreflightReport,
     torch_module: Any | None,
@@ -429,9 +541,11 @@ def _probe_torch(
         for arch in report.torch_arch_list
     ):
         rendered = ", ".join(report.torch_arch_list) or "empty"
-        report.errors.append(
-            "the PyTorch binary does not advertise an SM103 grouped-MM provider "
-            f"architecture (torch.cuda.get_arch_list(): {rendered})"
+        report.warnings.append(
+            "torch.cuda.get_arch_list() does not advertise SM103 "
+            f"({rendered}); this list is informational for Goal 1B because "
+            "the PyTorch grouped-MM provider is verified by an on-device "
+            "runtime probe"
         )
 
     try:
@@ -459,6 +573,14 @@ def _probe_torch(
         report.errors.append(
             f"no visible CC 10.3 GPU for {TARGET_ARCH}; found {visible}; refusing an architecture fallback"
         )
+
+    if (
+        inspect_installation
+        and report.target_gpu is not None
+        and report.grouped_mm_api_available
+    ):
+        _probe_grouped_mm_runtime(report, torch_module)
+
     return torch_module
 
 
@@ -626,6 +748,7 @@ def format_report(report: PreflightReport) -> str:
         + (", ".join(report.torch_arch_list) if report.torch_arch_list else "unavailable"),
         f"ATen GroupMM header: {report.groupmm_header or 'unavailable'}",
         f"PyTorch grouped_mm operator: {report.grouped_mm_api_available}",
+        f"PyTorch grouped_mm runtime probe: {report.grouped_mm_runtime_probe}",
         f"CUDA_HOME: {report.cuda_home or 'unavailable'}"
         + (f" (source: {report.cuda_home_source})" if report.cuda_home_source else ""),
         f"nvcc: {report.nvcc_path or 'unavailable'}",
